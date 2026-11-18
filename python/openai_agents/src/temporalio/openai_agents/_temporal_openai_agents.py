@@ -48,6 +48,7 @@ from temporalio.converter import (
     DefaultPayloadConverter,
     JSONPlainPayloadConverter,
 )
+from temporalio.openai_agents._background_responses import HeartbeatThrottle
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import ModelActivity
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
@@ -68,7 +69,7 @@ from temporalio.openai_agents.sandbox._on_host_sandbox_client_provider import (
     OnHostSandboxClientProvider,
 )
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import Worker, WorkflowRunner
+from temporalio.worker import Worker, WorkerConfig, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 if typing.TYPE_CHECKING:
@@ -575,6 +576,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
             else []
         )
 
+        # Set from each Worker's options by configure_worker, which runs add_activities.
+        self._heartbeat_throttle = HeartbeatThrottle()
+
         # Delay activity construction until they are actually needed
         def add_activities(
             activities: Sequence[Callable] | None,
@@ -583,7 +587,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 return activities or []
 
             model_activity = ModelActivity(
-                model_provider, resolvable_worker_env_vars=resolvable_env_vars
+                model_provider,
+                resolvable_worker_env_vars=resolvable_env_vars,
+                heartbeat_throttle=self._heartbeat_throttle,
             )
             new_activities = [
                 model_activity.invoke_model_activity,
@@ -676,6 +682,19 @@ class OpenAIAgentsPlugin(SimplePlugin):
             workflow_failure_exception_types=[AgentsWorkflowError],
             run_context=lambda: run_context(),
         )
+
+    def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
+        """See base class.
+
+        Also gives the model activity the Worker's heartbeat throttling, which
+        background model calls need and the activities callback isn't passed.
+        """
+        defaults = HeartbeatThrottle()
+        self._heartbeat_throttle = HeartbeatThrottle(
+            default=config.get("default_heartbeat_throttle_interval", defaults.default),
+            maximum=config.get("max_heartbeat_throttle_interval", defaults.maximum),
+        )
+        return super().configure_worker(config)
 
     async def run_worker(
         self, worker: Worker, next: Callable[[Worker], Awaitable[None]]

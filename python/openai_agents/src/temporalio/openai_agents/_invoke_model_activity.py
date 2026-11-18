@@ -10,7 +10,7 @@ import time
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 from agents import (
     AgentOutputSchemaBase,
@@ -26,6 +26,7 @@ from agents import (
     ModelSettings,
     ModelTracing,
     OpenAIProvider,
+    OpenAIResponsesModel,
     RunContextWrapper,
     Tool,
     ToolCaller,
@@ -58,9 +59,21 @@ from typing_extensions import Required, TypedDict
 from temporalio import activity
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents._background_responses import (
+    UNSUPPORTED_ERROR_TYPE,
+    BackgroundCall,
+    BackgroundOpenAIClient,
+    HeartbeatThrottle,
+    attempt_call,
+    cancel_reason,
+    inherited_response_id,
+    is_final_failure,
+    requests_background,
+)
 from temporalio.openai_agents._heartbeat_decorator import (
     auto_heartbeater,
     heartbeating,
+    set_heartbeat_details,
 )
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
@@ -435,6 +448,31 @@ def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
     ) from e
 
 
+async def _get_response(
+    model: Model,
+    input: ActivityModelInput,
+    model_settings: ModelSettings,
+    tools: list[Tool],
+    handoffs: list[Handoff[Any, Any]],
+) -> ModelResponse:
+    """Call ``model.get_response`` with the activity input, translating status errors."""
+    try:
+        return await model.get_response(
+            system_instructions=input.get("system_instructions"),
+            input=input["input"],
+            model_settings=model_settings,
+            tools=tools,
+            output_schema=input.get("output_schema"),
+            handoffs=handoffs,
+            tracing=ModelTracing(input["tracing"]),
+            previous_response_id=input.get("previous_response_id"),
+            conversation_id=input.get("conversation_id"),
+            prompt=input.get("prompt"),
+        )
+    except APIStatusError as e:
+        _raise_for_openai_status(e)
+
+
 def _cancel_requested() -> bool:
     """Whether the workflow asked to cancel the running activity."""
     details = activity.cancellation_details()
@@ -462,11 +500,32 @@ class ModelActivity:
         self,
         model_provider: ModelProvider | None = None,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
+        *,
+        heartbeat_throttle: HeartbeatThrottle | None = None,
     ):
-        """Initialize the activity with a model provider."""
-        self._model_provider = model_provider or OpenAIProvider(
-            openai_client=_default_openai_client()
-        )
+        """Initialize the activity with a model provider.
+
+        ``heartbeat_throttle`` is the Worker's heartbeat throttling, which background
+        model calls need to tell whether a response's ID has reached the server.
+        """
+        self._heartbeat_throttle = heartbeat_throttle or HeartbeatThrottle()
+        # The client of the default provider, which background model calls also use.
+        self._background_client: AsyncOpenAI | None = None
+        self._background_provider: ModelProvider | None = None
+        if model_provider:
+            self._model_provider = model_provider
+        else:
+            client = _default_openai_client()
+            self._model_provider = OpenAIProvider(openai_client=client)
+            # Only background model calls go through the wrapper, which sends every
+            # request with the same client.
+            self._background_client = client
+            self._background_provider = OpenAIProvider(
+                # A duck-typed stand-in, as the Agents SDK's own wrappers are.
+                openai_client=cast(
+                    AsyncOpenAI, cast(object, BackgroundOpenAIClient(client))
+                )
+            )
         self._env_refs = _WorkerEnvRefResolver(resolvable_worker_env_vars)
 
     @activity.defn
@@ -477,21 +536,129 @@ class ModelActivity:
         model_settings = _align_implicit_model_settings(input, model)
         tools, handoffs = _build_tools_and_handoffs(input, self._env_refs)
 
-        try:
-            return await model.get_response(
-                system_instructions=input.get("system_instructions"),
-                input=input["input"],
-                model_settings=model_settings,
-                tools=tools,
-                output_schema=input.get("output_schema"),
-                handoffs=handoffs,
-                tracing=ModelTracing(input["tracing"]),
-                previous_response_id=input.get("previous_response_id"),
-                conversation_id=input.get("conversation_id"),
-                prompt=input.get("prompt"),
+        if requests_background(model_settings.extra_args, model_settings.extra_body):
+            background_model = await self._background_model(input, model)
+            if background_model is not None:
+                return await self._invoke_in_background(
+                    background_model, input, model_settings, tools, handoffs
+                )
+
+        return await _get_response(model, input, model_settings, tools, handoffs)
+
+    async def _background_model(
+        self, input: ActivityModelInput, model: Model
+    ) -> Model | None:
+        """The model for a background call, None to call ``model`` as in a native run.
+
+        Raises a non-retryable ``ApplicationError`` before any request for a call that
+        would get an unfinished response back. Other models, such as the Responses
+        websocket and Chat Completions models, handle ``background`` as in a native run.
+        """
+        # Exact type: subclasses such as OpenAIResponsesWSModel send requests another way.
+        if type(model) is not OpenAIResponsesModel:
+            await self._abandon_inherited()
+            return None
+        if self._background_provider is None:
+            await self._refuse_background(
+                "background=True needs the plugin's default model provider. With a "
+                "custom model provider, the Agents SDK returns the background "
+                "response unfinished."
             )
-        except APIStatusError as e:
-            _raise_for_openai_status(e)
+        if activity.info().is_local:
+            await self._refuse_background(
+                "background=True needs a regular activity. Local activities record no "
+                "heartbeats, so a retry could not continue the background response. "
+                "Turn off use_local_activity for this call."
+            )
+        if input.get("conversation_id") is not None:
+            await self._refuse_background(
+                "background=True does not support conversation_id yet. Use "
+                "previous_response_id to chain responses."
+            )
+        assert self._background_provider is not None
+        background_model = self._background_provider.get_model(input.get("model_name"))
+        if type(background_model) is not OpenAIResponsesModel:
+            await self._abandon_inherited()
+            return None
+        return background_model
+
+    async def _abandon_inherited(self) -> None:
+        """Cancel an earlier attempt's background response this attempt won't continue.
+
+        An attempt on another worker, one that runs the call in the background, may
+        have started it.
+        """
+        response_id = inherited_response_id()
+        if response_id is None:
+            return
+        if self._background_client is not None:
+            await BackgroundCall(
+                self._background_client, response_id, seed=False
+            ).cancel("this worker does not run the call in the background")
+            # So that a later attempt doesn't find it again.
+            set_heartbeat_details()
+        else:
+            activity.logger.warning(
+                "Background response %s from an earlier attempt can't be cancelled "
+                "by this worker; it may run to the end and be billed",
+                response_id,
+            )
+
+    async def _refuse_background(self, message: str) -> NoReturn:
+        await self._abandon_inherited()
+        raise ApplicationError(message, type=UNSUPPORTED_ERROR_TYPE, non_retryable=True)
+
+    async def _invoke_in_background(
+        self,
+        model: Model,
+        input: ActivityModelInput,
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        handoffs: list[Handoff[Any, Any]],
+    ) -> ModelResponse:
+        """Run a background call that a retried attempt continues instead of repeating."""
+        assert self._background_client is not None
+        call = BackgroundCall(
+            self._background_client,
+            inherited_response_id(),
+            throttle=self._heartbeat_throttle,
+        )
+        with attempt_call(call):
+            try:
+                response = await _get_response(
+                    model, input, model_settings, tools, handoffs
+                )
+            except asyncio.CancelledError:
+                try:
+                    reason = await cancel_reason(call)
+                except Exception:
+                    # Report the cancel, not a failure deciding what to do with it.
+                    activity.logger.warning(
+                        "Could not tell whether another attempt will continue the "
+                        "background response, so it is left running",
+                        exc_info=True,
+                    )
+                    reason = None
+                if reason is not None:
+                    await call.cancel(reason)
+                raise
+            except Exception as e:
+                if is_final_failure(e):
+                    await call.cancel("the call failed with no retry to follow")
+                raise
+        if not call.intercepted:
+            # The Agents SDK sent the request some other way, and its response may be
+            # unfinished.
+            if response.response_id is not None:
+                call.adopt(response.response_id)
+                await call.cancel("the plugin could not wait for it")
+            raise ApplicationError(
+                "background=True is not supported with this version of the Agents "
+                "SDK: the plugin could not wait for the background response.",
+                type=UNSUPPORTED_ERROR_TYPE,
+                non_retryable=True,
+            )
+        return response
 
     @activity.defn
     async def invoke_model_activity_streaming(
