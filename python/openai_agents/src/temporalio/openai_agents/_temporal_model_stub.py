@@ -41,6 +41,10 @@ from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 from temporalio import workflow
 from temporalio.exceptions import ActivityError
+from temporalio.openai_agents._background_responses import (
+    background_responses_enabled,
+    requests_background,
+)
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -227,6 +231,11 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             conversation_id=conversation_id,
             prompt=prompt,
         )
+        if (
+            requests_background(model_settings.extra_args, model_settings.extra_body)
+            and background_responses_enabled()
+        ):
+            activity_input["background_responses"] = True
 
         agent = self.agent
         if agent is None and self._current_agent is not None:

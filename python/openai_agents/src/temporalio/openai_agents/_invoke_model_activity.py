@@ -63,7 +63,6 @@ from temporalio.openai_agents._background_responses import (
     UNSUPPORTED_ERROR_TYPE,
     BackgroundCall,
     BackgroundOpenAIClient,
-    HeartbeatThrottle,
     attempt_call,
     cancel_reason,
     inherited_response_id,
@@ -240,6 +239,9 @@ class ActivityModelInput(TypedDict, total=False):
     # the agent's settings are the SDK's implicit defaults, and the run-level overrides.
     implicit_model_settings: bool
     run_model_settings: ModelSettings | None
+    # Set by the workflow for a background call in a run that records the background
+    # responses patch. Without it, the call runs as on earlier releases.
+    background_responses: bool
 
 
 class StreamingActivityModelInput(ActivityModelInput, total=False):
@@ -500,15 +502,8 @@ class ModelActivity:
         self,
         model_provider: ModelProvider | None = None,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
-        *,
-        heartbeat_throttle: HeartbeatThrottle | None = None,
     ):
-        """Initialize the activity with a model provider.
-
-        ``heartbeat_throttle`` is the Worker's heartbeat throttling, which background
-        model calls need to tell whether a response's ID has reached the server.
-        """
-        self._heartbeat_throttle = heartbeat_throttle or HeartbeatThrottle()
+        """Initialize the activity with a model provider."""
         # The client of the default provider, which background model calls also use.
         self._background_client: AsyncOpenAI | None = None
         self._background_provider: ModelProvider | None = None
@@ -536,7 +531,9 @@ class ModelActivity:
         model_settings = _align_implicit_model_settings(input, model)
         tools, handoffs = _build_tools_and_handoffs(input, self._env_refs)
 
-        if requests_background(model_settings.extra_args, model_settings.extra_body):
+        if input.get("background_responses") and requests_background(
+            model_settings.extra_args, model_settings.extra_body
+        ):
             background_model = await self._background_model(input, model)
             if background_model is not None:
                 return await self._invoke_in_background(
@@ -618,11 +615,7 @@ class ModelActivity:
     ) -> ModelResponse:
         """Run a background call that a retried attempt continues instead of repeating."""
         assert self._background_client is not None
-        call = BackgroundCall(
-            self._background_client,
-            inherited_response_id(),
-            throttle=self._heartbeat_throttle,
-        )
+        call = BackgroundCall(self._background_client, inherited_response_id())
         with attempt_call(call):
             try:
                 response = await _get_response(
@@ -695,6 +688,22 @@ class ModelActivity:
         model = self._model_provider.get_model(input.get("model_name"))
         model_settings = _align_implicit_model_settings(input, model)
         tools, handoffs = _build_tools_and_handoffs(input, self._env_refs)
+
+        # A retry can't continue a streamed Responses API background response, and
+        # closing the stream doesn't stop it. Other models, such as Chat Completions,
+        # get background as in a native run. The websocket model is a subclass.
+        if (
+            input.get("background_responses")
+            and isinstance(model, OpenAIResponsesModel)
+            and requests_background(
+                model_settings.extra_args, model_settings.extra_body
+            )
+        ):
+            await self._refuse_background(
+                "background=True is not supported with streaming. A retry could not "
+                "continue the streamed background response, and closing the stream "
+                "would leave it running. Use Runner.run for this call."
+            )
 
         topic = input["streaming_topic"]
         batch_interval = input.get(

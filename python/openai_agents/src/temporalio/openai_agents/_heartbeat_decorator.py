@@ -15,9 +15,6 @@ class _HeartbeatDetails:
 
     def __init__(self) -> None:
         self.details: tuple[Any, ...] = ()
-        # Heartbeats sent so far. The worker sends an attempt's first heartbeat at
-        # once and throttles later ones.
-        self.sent = 0
 
 
 # Each heartbeat replaces the details the server holds, so the timer resends the
@@ -27,21 +24,16 @@ _current_details: ContextVar[_HeartbeatDetails | None] = ContextVar(
 )
 
 
-def set_heartbeat_details(*details: Any) -> bool:
+def set_heartbeat_details(*details: Any) -> None:
     """Heartbeat now with ``details``, and keep sending them on every later heartbeat.
 
     Inside a ``heartbeating`` block, the block's timer resends them. Outside one, this
-    only heartbeats once. Returns whether this was the block's first heartbeat, which
-    the worker sends at once rather than throttled; outside a block it returns True.
+    only heartbeats once.
     """
     box = _current_details.get()
-    first = True
     if box is not None:
         box.details = details
-        first = box.sent == 0
-        box.sent += 1
     activity.heartbeat(*details)
-    return first
 
 
 @overload
@@ -107,8 +99,4 @@ async def _heartbeat_every(delay: float) -> None:
     while True:
         await asyncio.sleep(delay)
         box = _current_details.get()
-        if box is None:
-            activity.heartbeat()
-            continue
-        box.sent += 1
-        activity.heartbeat(*box.details)
+        activity.heartbeat(*(box.details if box is not None else ()))

@@ -23,6 +23,7 @@ from tests.test_openai import (
     RunModelProviderWorkflow,
     ToolsWorkflow,
 )
+from tests.test_openai_background import BackgroundAgentWorkflow
 
 # Replay is promised only within a major (see AGENTS.md), so only the histories
 # in the current major's folder replay.
@@ -33,6 +34,11 @@ HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
 @pytest.mark.parametrize(
     "file_name",
     [
+        # A background model call recorded with the patch's gate off, as on 2.0.0: no
+        # patch marker, and the call returns its response unfinished.
+        "background-call-before-patch-workflow-history.json",
+        # The same call after the patch: a patch marker before the model activity.
+        "background-call-workflow-history.json",
         # The run gets its own agent back, so it starts a timer.
         "caller-agent-workflow-history.json",
         # Recorded with the workflow worker stopped, so that one activation
@@ -53,6 +59,7 @@ async def test_replay(file_name: str) -> None:
         )
         await Replayer(
             workflows=[
+                BackgroundAgentWorkflow,
                 ResearchWorkflow,
                 ToolsWorkflow,
                 CustomerServiceWorkflow,

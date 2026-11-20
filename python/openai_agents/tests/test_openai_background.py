@@ -15,7 +15,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, get_args
 
 import pytest
 import pytest_asyncio
@@ -35,29 +35,36 @@ from agents import (
     Usage,
 )
 from agents.exceptions import ModelBehaviorError
+from agents.items import TResponseStreamEvent
 from agents.models import _openai_shared
-from openai import APIConnectionError, AsyncOpenAI
+from openai import AsyncOpenAI
+from openai.types.responses import ResponseError
 
 from temporalio import workflow
 from temporalio.activity import ActivityCancellationDetails
 from temporalio.api.enums.v1 import EventType, PendingActivityState
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.common import RetryPolicy
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 from temporalio.openai_agents import (
     ModelActivityParameters,
-    OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
     _background_responses,
+    _openai_runner,
+    _temporal_model_stub,
 )
 from temporalio.openai_agents._background_responses import (
     _DETAILS_KEY,
+    _PERMANENT_ERROR_CODES,
+    BACKGROUND_RESPONSES_PATCH,
     UNSUPPORTED_ERROR_TYPE,
     BackgroundCall,
     BackgroundOpenAIClient,
-    HeartbeatThrottle,
     _PollSchedule,
     attempt_call,
+    is_final_failure,
 )
 from temporalio.openai_agents._heartbeat_decorator import (
     heartbeating,
@@ -67,11 +74,11 @@ from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
     ModelActivity,
     ModelTracingInput,
+    StreamingActivityModelInput,
 )
 from temporalio.openai_agents.testing import AgentEnvironment
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import ActivityEnvironment
-from temporalio.worker import Worker
 from tests.helpers import assert_eventually, new_worker
 
 if TYPE_CHECKING:
@@ -79,6 +86,8 @@ if TYPE_CHECKING:
     import httpx2
 
 BACKGROUND = ModelSettings(extra_args={"background": True})
+# A retrieve answer whose body the OpenAI client can't parse, an error it doesn't retry.
+MALFORMED = -1
 
 CHAT_COMPLETION = {
     "id": "chatcmpl-1",
@@ -178,7 +187,8 @@ class FakeResponsesAPI:
         self.retrieves: list[httpx2.Request] = []
         self.cancels: list[str] = []
         # Status codes to answer the next retrieves and cancels with, alone or with
-        # response headers. 0 drops the connection.
+        # response headers. 0 drops the connection, MALFORMED sends a body that isn't
+        # JSON.
         self.retrieve_errors: list[int | tuple[int, dict[str, str]]] = []
         self.cancel_errors: list[int | tuple[int, dict[str, str]]] = []
         self.chat_completions = 0
@@ -213,6 +223,10 @@ class FakeResponsesAPI:
             status, headers = reply if isinstance(reply, tuple) else (reply, {})
             if status == 0:
                 raise httpx2.ConnectError("connection dropped", request=request)
+            if status == MALFORMED:
+                return httpx2.Response(
+                    200, content=b"{", headers={"content-type": "application/json"}
+                )
             return httpx2.Response(
                 status,
                 headers=headers,
@@ -274,8 +288,12 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[FakeResponsesAPI
 
 
 def model_input(
-    settings: ModelSettings = BACKGROUND, conversation_id: str | None = None
+    settings: ModelSettings = BACKGROUND,
+    conversation_id: str | None = None,
+    *,
+    patched: bool = True,
 ) -> ActivityModelInput:
+    """A model call's input, by default from a run that records the patch."""
     return ActivityModelInput(
         model_name="gpt-4o",
         input="Hi",
@@ -284,6 +302,7 @@ def model_input(
         tools=[],
         handoffs=[],
         conversation_id=conversation_id,
+        background_responses=patched,
     )
 
 
@@ -394,40 +413,6 @@ def test_heartbeat_details_survive_the_payload_converter() -> None:
     assert converter.from_payloads(converter.to_payloads([details])) == [details]
 
 
-@pytest.mark.parametrize(
-    ("throttle", "heartbeat_timeout", "interval"),
-    [
-        (HeartbeatThrottle(), timedelta(seconds=10), timedelta(seconds=8)),
-        (HeartbeatThrottle(), None, timedelta(seconds=30)),
-        # Core takes a zero heartbeat timeout for none.
-        (HeartbeatThrottle(), timedelta(0), timedelta(seconds=30)),
-        (
-            HeartbeatThrottle(maximum=timedelta(seconds=5)),
-            timedelta(seconds=10),
-            timedelta(seconds=5),
-        ),
-        (
-            HeartbeatThrottle(default=timedelta(seconds=90)),
-            None,
-            timedelta(seconds=60),
-        ),
-    ],
-    ids=[
-        "heartbeat-timeout",
-        "default",
-        "zero-heartbeat-timeout",
-        "maximum-caps-heartbeat-timeout",
-        "maximum-caps-default",
-    ],
-)
-def test_heartbeat_throttle_is_computed_as_the_worker_does(
-    throttle: HeartbeatThrottle,
-    heartbeat_timeout: timedelta | None,
-    interval: timedelta,
-) -> None:
-    assert throttle.interval(heartbeat_timeout) == interval
-
-
 # Starting and waiting
 
 
@@ -527,11 +512,18 @@ async def test_retry_returns_a_response_that_finished_meanwhile(
     "job",
     [
         {"status": "failed", "error_code": "server_error"},
+        {"status": "failed", "error_code": "a_code_openai_adds_later"},
         {"status": "incomplete"},
         {"status": "cancelled"},
         {"gone": True},
     ],
-    ids=["failed-transiently", "incomplete", "cancelled", "gone"],
+    ids=[
+        "failed-transiently",
+        "failed-with-an-unknown-code",
+        "incomplete",
+        "cancelled",
+        "gone",
+    ],
 )
 async def test_retry_starts_a_new_response_when_the_earlier_one_cant_be_used(
     api: FakeResponsesAPI, job: dict[str, Any]
@@ -569,18 +561,16 @@ async def test_retry_fails_fast_when_the_earlier_response_failed_for_good(
     assert api.creates == []
 
 
-async def test_retry_keeps_the_earlier_response_after_a_transient_read_error(
+async def test_retry_reads_the_earlier_response_again_after_a_transient_error(
     api: FakeResponsesAPI,
 ) -> None:
     api.add_job(Job(id="resp_old", status="in_progress"))
     api.retrieve_errors = [500]
-    env, heartbeats = activity_env(heartbeat_details=inherited("resp_old"), attempt=2)
-    with pytest.raises(ApplicationError) as err:
-        await env.run(ModelActivity().invoke_model_activity, model_input())
-    assert not err.value.non_retryable
+    env, _ = activity_env(heartbeat_details=inherited("resp_old"), attempt=2)
+    response = await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert response.response_id == "resp_old"
     assert api.creates == []
     assert api.cancels == []
-    assert heartbeats[-1] == ({_DETAILS_KEY: "resp_old"},)
 
 
 # How a watched response ends
@@ -598,11 +588,25 @@ async def test_permanent_failure_is_not_retried(api: FakeResponsesAPI) -> None:
     assert api.cancels == []
 
 
-async def test_transient_failure_fails_as_in_a_native_run(
-    api: FakeResponsesAPI,
+def test_permanent_error_codes_are_openai_error_codes() -> None:
+    # A misspelled code would be retried, paying for a new response each time.
+    assert _PERMANENT_ERROR_CODES <= set(
+        get_args(ResponseError.model_fields["code"].annotation)
+    )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["server_error", "a_code_openai_adds_later"],
+    ids=["transient-code", "unknown-code"],
+)
+async def test_other_failure_fails_as_in_a_native_run(
+    api: FakeResponsesAPI, error_code: str
 ) -> None:
     api.script = ["failed"]
+    api.error_code = error_code
     env, _ = activity_env()
+    # Left to the retry policy, as an error without an HTTP status is.
     with pytest.raises(ModelBehaviorError):
         await env.run(ModelActivity().invoke_model_activity, model_input())
 
@@ -638,22 +642,35 @@ async def test_retryable_error_cancels_only_on_the_last_attempt(
     api: FakeResponsesAPI, attempt: int, cancelled: bool
 ) -> None:
     api.script = ["in_progress"]
-    api.retrieve_errors = [503]
+    api.retrieve_errors = [MALFORMED]
     env, _ = activity_env(attempt=attempt, maximum_attempts=3)
-    with pytest.raises(ApplicationError):
+    with pytest.raises(ValueError):
         await env.run(ModelActivity().invoke_model_activity, model_input())
     assert api.cancels == (["resp_1"] if cancelled else [])
 
 
 async def test_error_type_the_policy_wont_retry_cancels(api: FakeResponsesAPI) -> None:
     api.script = ["in_progress"]
+    api.retrieve_errors = [MALFORMED]
+    env, _ = activity_env(
+        retry_policy=RetryPolicy(non_retryable_error_types=["JSONDecodeError"])
+    )
+    with pytest.raises(ValueError):
+        await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert api.cancels == ["resp_1"]
+
+
+async def test_read_again_despite_the_policys_non_retryable_types(
+    api: FakeResponsesAPI,
+) -> None:
+    # The policy governs the server's retries of the activity; a read resends nothing.
     api.retrieve_errors = [503]
     env, _ = activity_env(
         retry_policy=RetryPolicy(non_retryable_error_types=["APIStatusError"])
     )
-    with pytest.raises(ApplicationError):
-        await env.run(ModelActivity().invoke_model_activity, model_input())
-    assert api.cancels == ["resp_1"]
+    response = await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert response.response_id == "resp_1"
+    assert api.cancels == []
 
 
 @pytest.mark.parametrize(
@@ -672,14 +689,62 @@ async def test_schedule_to_close_deadline_decides_the_last_attempt(
     cancelled: bool,
 ) -> None:
     api.script = ["in_progress"]
-    api.retrieve_errors = [503]
+    api.retrieve_errors = [MALFORMED]
     env, _ = activity_env(
         retry_policy=RetryPolicy(initial_interval=initial_interval),
         schedule_to_close_timeout=schedule_to_close,
     )
-    with pytest.raises(ApplicationError):
+    with pytest.raises(ValueError):
         await env.run(ModelActivity().invoke_model_activity, model_input())
     assert api.cancels == (["resp_1"] if cancelled else [])
+
+
+@pytest.mark.parametrize(
+    ("delay", "final"),
+    [(60, True), (5, False)],
+    ids=["retry-past-deadline", "retry-before-deadline"],
+)
+async def test_provider_retry_delay_decides_the_last_attempt(
+    delay: int, final: bool
+) -> None:
+    # The policy alone would retry before the deadline, so only the failure's own
+    # delay can put the next attempt after it.
+    env, _ = activity_env(
+        retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1)),
+        schedule_to_close_timeout=timedelta(seconds=30),
+    )
+    err = ApplicationError("busy", next_retry_delay=timedelta(seconds=delay))
+
+    async def is_final() -> bool:
+        return is_final_failure(err)
+
+    assert await env.run(is_final) is final
+
+
+@pytest.mark.parametrize(
+    ("coefficient", "attempt"),
+    [(1.01, 500), (2.0, 5000)],
+    ids=["slow-backoff", "overflowing-backoff"],
+)
+async def test_backoff_after_many_attempts_reaches_the_maximum_interval(
+    coefficient: float, attempt: int
+) -> None:
+    # 1.01 ** 499 is about 144, so the next retry waits the 100 s maximum, past the
+    # deadline. 2.0 ** 4999 overflows a float.
+    env, _ = activity_env(
+        attempt=attempt,
+        retry_policy=RetryPolicy(
+            initial_interval=timedelta(seconds=1),
+            backoff_coefficient=coefficient,
+            maximum_interval=timedelta(seconds=100),
+        ),
+        schedule_to_close_timeout=timedelta(seconds=50),
+    )
+
+    async def is_final() -> bool:
+        return is_final_failure(ValueError())
+
+    assert await env.run(is_final)
 
 
 def retry_after(form: str, seconds: int) -> dict[str, str]:
@@ -691,48 +756,51 @@ def retry_after(form: str, seconds: int) -> dict[str, str]:
     return {"retry-after": email.utils.formatdate(time.time() + seconds, usegmt=True)}
 
 
-@pytest.mark.parametrize("form", ["ms", "seconds", "http-date"])
-@pytest.mark.parametrize(
-    ("delay", "cancelled"),
-    [(60, True), (5, False)],
-    ids=["retry-past-deadline", "retry-before-deadline"],
-)
-async def test_provider_retry_delay_decides_the_last_attempt(
-    api: FakeResponsesAPI, form: str, delay: int, cancelled: bool
-) -> None:
-    # The policy alone would retry before the deadline, so only the provider's delay
-    # can put the next attempt after it.
-    api.script = ["in_progress"]
-    api.retrieve_errors = [(429, retry_after(form, delay))]
-    env, heartbeats = activity_env(
-        retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1)),
-        schedule_to_close_timeout=timedelta(seconds=30),
-    )
-    with pytest.raises(ApplicationError) as err:
-        await env.run(ModelActivity().invoke_model_activity, model_input())
-    assert err.value.type == "APIStatusError"
-    assert not err.value.non_retryable
-    # An HTTP date has whole seconds, and the test takes time to get there.
-    next_delay = err.value.next_retry_delay
-    assert next_delay is not None
-    assert timedelta(seconds=delay - 2) < next_delay <= timedelta(seconds=delay)
-    assert api.cancels == (["resp_1"] if cancelled else [])
-    if not cancelled:
-        # The retry continues the response.
-        assert heartbeats[-1] == ({_DETAILS_KEY: "resp_1"},)
-
-
-async def test_connection_error_while_waiting_is_retried(
+async def test_transient_read_error_on_the_last_attempt_reads_again(
     api: FakeResponsesAPI,
 ) -> None:
-    api.script = ["in_progress"]
-    api.retrieve_errors = [0]
-    env, heartbeats = activity_env()
-    with pytest.raises(APIConnectionError):
-        await env.run(ModelActivity().invoke_model_activity, model_input())
-    # The next attempt continues the response.
+    # Reading resends no request, so the attempt goes on instead of ending.
+    api.retrieve_errors = [503, 503]
+    env, _ = activity_env(attempt=3, maximum_attempts=3)
+    response = await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert response.response_id == "resp_1"
+    assert len(api.creates) == 1
     assert api.cancels == []
-    assert heartbeats[-1] == ({_DETAILS_KEY: "resp_1"},)
+
+
+async def test_connection_error_while_waiting_reads_again(
+    api: FakeResponsesAPI,
+) -> None:
+    api.retrieve_errors = [0]
+    env, _ = activity_env()
+    response = await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert response.response_id == "resp_1"
+    assert len(api.creates) == 1
+    assert api.cancels == []
+
+
+@pytest.mark.parametrize("form", ["ms", "seconds", "http-date"])
+async def test_read_again_waits_for_the_provider_retry_delay(
+    api: FakeResponsesAPI, form: str
+) -> None:
+    api.retrieve_errors = [(429, retry_after(form, 2))]
+    env, _ = activity_env()
+    started = time.monotonic()
+    response = await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert response.response_id == "resp_1"
+    # An HTTP date has whole seconds.
+    assert time.monotonic() - started >= 1
+    assert api.cancels == []
+
+
+async def test_permanent_read_error_ends_the_attempt(api: FakeResponsesAPI) -> None:
+    api.retrieve_errors = [400]
+    env, _ = activity_env()
+    with pytest.raises(ApplicationError) as err:
+        await env.run(ModelActivity().invoke_model_activity, model_input())
+    assert err.value.non_retryable
+    assert len(api.retrieves) == 1
+    assert api.cancels == ["resp_1"]
 
 
 # Cancels
@@ -742,7 +810,8 @@ async def test_connection_error_while_waiting_is_retried(
     ("details", "attempt", "cancelled"),
     [
         (ActivityCancellationDetails(cancel_requested=True), 1, True),
-        (ActivityCancellationDetails(reset=True), 1, True),
+        # Temporal keeps heartbeat details on reset unless asked to clear them.
+        (ActivityCancellationDetails(reset=True), 1, False),
         (ActivityCancellationDetails(cancel_requested=True, paused=True), 1, True),
         (ActivityCancellationDetails(paused=True), 1, False),
         (ActivityCancellationDetails(worker_shutdown=True), 1, False),
@@ -789,11 +858,16 @@ class FakeTemporalClient:
 
     def __init__(self, outcome: Any) -> None:
         self.outcome = outcome
+        self.describes = 0
+        self.data_converter = DataConverter(
+            payload_converter_class=OpenAIPayloadConverter
+        )
 
     def get_workflow_handle(self, *_args: Any, **_kwargs: Any) -> Any:
         return self
 
     async def describe(self) -> Any:
+        self.describes += 1
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
@@ -802,9 +876,26 @@ class FakeTemporalClient:
 def description(
     status: WorkflowExecutionStatus = WorkflowExecutionStatus.RUNNING,
     state: Any = PendingActivityState.PENDING_ACTIVITY_STATE_STARTED,
+    held: str | None = "resp_1",
+    attempt: int = 2,
 ) -> Any:
+    """A workflow description, whose pending activity's details hold the ID ``held``.
+
+    The activity is pending at ``attempt``, by default the retry of the first attempt.
+    """
+    details = [{_DETAILS_KEY: held}] if held is not None else []
+    payloads = OpenAIPayloadConverter().to_payloads(details)
     pending = (
-        [SimpleNamespace(activity_id="test", state=state)] if state is not None else []
+        [
+            SimpleNamespace(
+                activity_id="test",
+                state=state,
+                attempt=attempt,
+                heartbeat_details=SimpleNamespace(payloads=payloads),
+            )
+        ]
+        if state is not None
+        else []
     )
     return SimpleNamespace(
         status=status, raw_description=SimpleNamespace(pending_activities=pending)
@@ -821,6 +912,8 @@ def description(
             ),
             True,
         ),
+        (description(held=None), True),
+        (description(held="resp_old"), True),
         (description(state=None), True),
         (description(status=WorkflowExecutionStatus.CANCELED, state=None), True),
         (RPCError("gone", RPCStatusCode.NOT_FOUND, b""), True),
@@ -830,6 +923,8 @@ def description(
     ids=[
         "still-pending",
         "cancel-requested",
+        "id-not-held",
+        "other-id-held",
         "no-longer-pending",
         "workflow-closed",
         "workflow-gone",
@@ -870,31 +965,13 @@ async def test_cancel_during_create_still_cancels_the_response(
 async def test_id_recorded_after_a_timeout_cancels_the_response(
     api: FakeResponsesAPI,
 ) -> None:
-    # The worker drops heartbeats once it knows the attempt is gone, so a retry
-    # could never continue a response whose ID arrived after the timeout.
+    # OpenAI answered after the timeout, so the server never got the ID.
     api.create_delay = 0.2
-    env, _ = activity_env(maximum_attempts=3)
-    async with running(env) as task:
-        await assert_eventually(sending(api))
-        env.cancel(ActivityCancellationDetails(timed_out=True, not_found=True))
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    assert api.cancels == ["resp_1"]
-
-
-async def test_throttled_id_cancels_the_response_after_a_timeout(
-    api: FakeResponsesAPI,
-) -> None:
-    # The timer sends the attempt's first heartbeat before OpenAI answers, so the
-    # worker throttles the heartbeat carrying the ID, for up to 0.8 s here.
-    api.hold = True
-    api.create_delay = 0.7
-    env, heartbeats = activity_env(
-        maximum_attempts=3, heartbeat_timeout=timedelta(seconds=1)
+    env, _ = activity_env(
+        maximum_attempts=3, client=FakeTemporalClient(description(held=None))
     )
     async with running(env) as task:
-        await assert_eventually(polling(api))
-        assert heartbeats[0] == ()
+        await assert_eventually(sending(api))
         env.cancel(ActivityCancellationDetails(timed_out=True, not_found=True))
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -902,52 +979,106 @@ async def test_throttled_id_cancels_the_response_after_a_timeout(
 
 
 @pytest.mark.parametrize(
-    ("throttle", "cancelled"),
-    [
-        (HeartbeatThrottle(default=timedelta(milliseconds=50)), False),
-        (HeartbeatThrottle(), True),
-    ],
-    ids=["throttle-elapsed", "throttle-not-elapsed"],
+    ("held", "cancelled"),
+    [("resp_1", False), (None, True), ("resp_old", True)],
+    ids=["id-held", "no-id-held", "earlier-id-held"],
 )
-async def test_workers_throttle_decides_whether_a_timeout_cancels_the_response(
-    api: FakeResponsesAPI, throttle: HeartbeatThrottle, cancelled: bool
+async def test_timeout_cancels_a_response_whose_id_the_server_lacks(
+    api: FakeResponsesAPI, held: str | None, cancelled: bool
 ) -> None:
-    # The earlier attempt's response is gone. The attempt's first heartbeat carried
-    # its ID, so the worker throttles the one that carries the new response's ID.
+    # The earlier attempt's response is gone, so this attempt starts another. Whether
+    # the heartbeat with the new ID reached the server decides what a retry finds.
     api.hold = True
+    client = FakeTemporalClient(description(held=held, attempt=3))
     env, _ = activity_env(
-        heartbeat_details=inherited("resp_old"), attempt=2, maximum_attempts=3
+        heartbeat_details=inherited("resp_old"),
+        attempt=2,
+        maximum_attempts=3,
+        client=client,
     )
-    async with running(env, ModelActivity(heartbeat_throttle=throttle)) as task:
-        await assert_eventually(sending(api))
-        # Longer than the 50 ms throttle, far shorter than the default 30 seconds.
-        await asyncio.sleep(0.2)
-        env.cancel(ActivityCancellationDetails(timed_out=True, not_found=True))
+
+    async def polling_the_new_response() -> None:
+        assert api.creates and len(api.retrieves) > 1
+
+    async with running(env) as task:
+        await assert_eventually(polling_the_new_response)
+        env.cancel(ActivityCancellationDetails(timed_out=True))
         with pytest.raises(asyncio.CancelledError):
             await task
+    assert client.describes == 1
     assert api.cancels == (["resp_1"] if cancelled else [])
 
 
-# The fake API is the default client, which the plugin's model activity needs.
-@pytest.mark.usefixtures("api")
-async def test_plugin_gives_the_model_activity_the_workers_throttle(
-    client: Client,
+@pytest.mark.parametrize(
+    ("attempt", "pending_attempt", "held", "cancelled"),
+    [
+        (2, 3, "resp_old", False),
+        # As after update-options raised maximum_attempts during the attempt.
+        (3, 4, "resp_old", False),
+        # The server hasn't processed the timeout yet, so the policy decides.
+        (2, 2, "resp_old", False),
+        (3, 3, "resp_old", True),
+        # An operator reset the activity and kept its heartbeat details.
+        (3, 1, "resp_old", False),
+        (2, 3, None, True),
+    ],
+    ids=[
+        "retry",
+        "retry-past-the-policy",
+        "undecided-retry-left",
+        "undecided-last-attempt",
+        "reset",
+        "details-cleared",
+    ],
+)
+async def test_timeout_follows_the_servers_retry_decision(
+    api: FakeResponsesAPI,
+    attempt: int,
+    pending_attempt: int,
+    held: str | None,
+    cancelled: bool,
 ) -> None:
-    worker = Worker(
-        client,
-        task_queue=str(uuid.uuid4()),
-        plugins=[OpenAIAgentsPlugin()],
-        default_heartbeat_throttle_interval=timedelta(seconds=90),
-        max_heartbeat_throttle_interval=timedelta(seconds=120),
+    api.add_job(Job(id="resp_old", status="in_progress", held=True))
+    client = FakeTemporalClient(description(held=held, attempt=pending_attempt))
+    env, _ = activity_env(
+        heartbeat_details=inherited("resp_old"),
+        attempt=attempt,
+        maximum_attempts=3,
+        client=client,
     )
-    [model_activity] = {
-        owner
-        for act in worker.config(active_config=True).get("activities", [])
-        if isinstance(owner := getattr(act, "__self__", None), ModelActivity)
-    }
-    assert model_activity._heartbeat_throttle == HeartbeatThrottle(
-        default=timedelta(seconds=90), maximum=timedelta(seconds=120)
-    )
+    async with running(env) as task:
+        await assert_eventually(polling(api))
+        env.cancel(ActivityCancellationDetails(timed_out=True))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert client.describes == 1
+    assert api.cancels == (["resp_old"] if cancelled else [])
+
+
+@pytest.mark.parametrize(
+    ("error", "says"),
+    [
+        (RPCError("refused", RPCStatusCode.PERMISSION_DENIED, b""), "permission"),
+        (RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b""), "it failed"),
+    ],
+    ids=["refused", "failed"],
+)
+async def test_failed_describe_says_why(
+    api: FakeResponsesAPI,
+    caplog: pytest.LogCaptureFixture,
+    error: RPCError,
+    says: str,
+) -> None:
+    api.hold = True
+    env, _ = activity_env(maximum_attempts=3, client=FakeTemporalClient(error))
+    async with running(env) as task:
+        await assert_eventually(polling(api))
+        env.cancel(ActivityCancellationDetails(not_found=True))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    [warning] = [r for r in caplog.records if "Could not describe" in r.getMessage()]
+    assert says in warning.getMessage()
+    assert ("permission" in warning.getMessage()) == (says == "permission")
 
 
 async def test_create_reply_that_never_comes_is_logged(
@@ -1056,8 +1187,36 @@ class RecordingModel(Model):
         self.settings.append(model_settings)
         return ModelResponse(output=[], usage=Usage(), response_id=None)
 
-    def stream_response(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        self.settings.append(model_settings)
+        events: list[TResponseStreamEvent] = []
+        for event in events:
+            yield event
+
+
+def streaming_model_input(
+    settings: ModelSettings = BACKGROUND, *, patched: bool = True
+) -> Any:
+    return StreamingActivityModelInput(
+        model_name="gpt-4o",
+        input="Hi",
+        model_settings=settings,
+        tracing=ModelTracingInput.DISABLED,
+        tools=[],
+        handoffs=[],
+        streaming_topic="events",
+        background_responses=patched,
+    )
 
 
 async def test_other_models_get_background_as_in_a_native_run() -> None:
@@ -1065,6 +1224,101 @@ async def test_other_models_get_background_as_in_a_native_run() -> None:
     env, _ = activity_env()
     await env.run(ModelActivity(ProviderOf(model)).invoke_model_activity, model_input())
     assert model.settings[0].extra_args == {"background": True}
+
+
+class NullStream:
+    """A workflow stream client that publishes nowhere."""
+
+    def topic(self, _name: str) -> Any:
+        return SimpleNamespace(publish=lambda event: None)
+
+    async def __aenter__(self) -> NullStream:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
+
+
+async def test_other_streamed_models_get_background_as_in_a_native_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        WorkflowStreamClient,
+        "from_within_activity",
+        classmethod(lambda cls, **kwargs: NullStream()),
+    )
+    model = RecordingModel()
+    env, _ = activity_env()
+    await env.run(
+        ModelActivity(ProviderOf(model)).invoke_model_activity_streaming,
+        streaming_model_input(),
+    )
+    assert model.settings[0].extra_args == {"background": True}
+
+
+@pytest.mark.parametrize(
+    ("settings", "custom_provider"),
+    [
+        (BACKGROUND, False),
+        (ModelSettings(extra_body={"background": True}), False),
+        (BACKGROUND, True),
+    ],
+    ids=["extra-args", "extra-body", "custom-provider"],
+)
+async def test_streamed_background_call_is_refused_before_any_request(
+    api: FakeResponsesAPI, settings: ModelSettings, custom_provider: bool
+) -> None:
+    env, _ = activity_env()
+    activity = (
+        ModelActivity(
+            ProviderOf(OpenAIResponsesModel(model="gpt-4o", openai_client=api.client))
+        )
+        if custom_provider
+        else ModelActivity()
+    )
+    with pytest.raises(ApplicationError) as err:
+        await env.run(
+            activity.invoke_model_activity_streaming, streaming_model_input(settings)
+        )
+    assert err.value.type == UNSUPPORTED_ERROR_TYPE
+    assert err.value.non_retryable
+    assert "streaming" in str(err.value)
+    assert api.creates == []
+
+
+async def test_call_from_before_the_patch_runs_as_before(
+    api: FakeResponsesAPI,
+) -> None:
+    api.add_job(Job(id="resp_old", status="in_progress"))
+    # Even with an ID in its details, which only a patched call would record.
+    env, heartbeats = activity_env(heartbeat_details=inherited("resp_old"), attempt=2)
+    response = await env.run(
+        ModelActivity().invoke_model_activity, model_input(patched=False)
+    )
+    # The Agents SDK returns the background response as OpenAI first answers it.
+    assert response.response_id == "resp_1"
+    assert api.creates[0]["background"] is True
+    assert api.retrieves == []
+    assert api.cancels == []
+    assert heartbeats == []
+
+
+async def test_streamed_call_from_before_the_patch_is_not_refused(
+    api: FakeResponsesAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        WorkflowStreamClient,
+        "from_within_activity",
+        classmethod(lambda cls, **kwargs: NullStream()),
+    )
+    env, _ = activity_env()
+    # The fake answers with JSON rather than a stream, so no events come back.
+    await env.run(
+        ModelActivity().invoke_model_activity_streaming,
+        streaming_model_input(patched=False),
+    )
+    assert api.creates[0]["stream"] is True
+    assert api.creates[0]["background"] is True
 
 
 async def test_sdk_that_bypasses_create_is_detected(
@@ -1186,6 +1440,7 @@ async def test_client_wrapper_copies_stay_wrapped(api: FakeResponsesAPI) -> None
 @dataclass
 class BackgroundRun:
     cancel_call: bool = False
+    background: bool = True
 
 
 @workflow.defn
@@ -1200,7 +1455,7 @@ class BackgroundAgentWorkflow:
             name="Assistant",
             instructions="Be brief.",
             model="gpt-4o",
-            model_settings=BACKGROUND,
+            model_settings=BACKGROUND if run.background else ModelSettings(),
         )
         if not run.cancel_call:
             result = await Runner.run(starting_agent=agent, input="Hi")
@@ -1248,21 +1503,87 @@ async def model_attempts(client: Client, workflow_id: str) -> list[int]:
     return attempts
 
 
+async def patch_ids(client: Client, workflow_id: str) -> list[str]:
+    """The IDs of the patch markers in a workflow's history."""
+    ids: list[str] = []
+    async for event in client.get_workflow_handle(workflow_id).fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_MARKER_RECORDED:
+            details = event.marker_recorded_event_attributes.details
+            if "patch-data" in details:
+                for payload in details["patch-data"].payloads:
+                    ids.append(json.loads(payload.data)["id"])
+    return ids
+
+
 async def test_workflow_gets_the_background_response(
     client: Client, api: FakeResponsesAPI
 ) -> None:
+    workflow_id = f"background-{uuid.uuid4()}"
     async with agent_environment() as env:
         client = env.applied_on_client(client)
         async with new_worker(client, BackgroundAgentWorkflow) as worker:
             result = await client.execute_workflow(
                 BackgroundAgentWorkflow.run,
                 BackgroundRun(),
-                id=f"background-{uuid.uuid4()}",
+                id=workflow_id,
                 task_queue=worker.task_queue,
             )
     assert result == "Done. 8"
     assert len(api.creates) == 1
     assert api.cancels == []
+    assert BACKGROUND_RESPONSES_PATCH in await patch_ids(client, workflow_id)
+
+
+async def test_run_evaluates_the_patch_before_its_first_model_call(
+    client: Client, api: FakeResponsesAPI
+) -> None:
+    # Even without background, so that a run on an earlier release that hasn't yet
+    # reached a background call replays without the marker and keeps the old behavior.
+    workflow_id = f"background-{uuid.uuid4()}"
+    async with agent_environment() as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, BackgroundAgentWorkflow) as worker:
+            await client.execute_workflow(
+                BackgroundAgentWorkflow.run,
+                BackgroundRun(background=False),
+                id=workflow_id,
+                task_queue=worker.task_queue,
+            )
+    events = [
+        event.event_type
+        async for event in client.get_workflow_handle(
+            workflow_id
+        ).fetch_history_events()
+    ]
+    assert events.index(EventType.EVENT_TYPE_MARKER_RECORDED) < events.index(
+        EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    )
+    assert await patch_ids(client, workflow_id) == [BACKGROUND_RESPONSES_PATCH]
+    assert api.creates[0].get("background") is None
+
+
+async def test_run_from_before_the_patch_keeps_the_earlier_behavior(
+    client: Client, api: FakeResponsesAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A run that started an agent run on an earlier release replays without the
+    # patch marker, as if the gate were off.
+    for module in (_openai_runner, _temporal_model_stub):
+        monkeypatch.setattr(module, "background_responses_enabled", lambda: False)
+    workflow_id = f"background-{uuid.uuid4()}"
+    async with agent_environment() as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, BackgroundAgentWorkflow) as worker:
+            result = await client.execute_workflow(
+                BackgroundAgentWorkflow.run,
+                BackgroundRun(),
+                id=workflow_id,
+                task_queue=worker.task_queue,
+            )
+    # The model call returned the background response unfinished, with no output.
+    assert result != "Done. 8"
+    assert len(api.creates) == 1
+    assert api.retrieves == []
+    assert BACKGROUND_RESPONSES_PATCH not in await patch_ids(client, workflow_id)
 
 
 async def test_another_worker_continues_the_response_after_a_shutdown(

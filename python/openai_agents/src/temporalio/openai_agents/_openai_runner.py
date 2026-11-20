@@ -25,6 +25,9 @@ from typing_extensions import Unpack
 
 from temporalio import workflow
 from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents._background_responses import (
+    background_responses_enabled,
+)
 from temporalio.openai_agents._errors import (
     AgentsWorkflowError,
     NonRetryableAgentsWorkflowError,
@@ -410,6 +413,8 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        # Evaluate the gate before the run schedules its first model Activity.
+        background_responses_enabled()
 
         run = _AgentRun()
         parent = _current_agent_run.get()
@@ -504,6 +509,8 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        # Evaluate the gate before the run schedules its first model Activity.
+        background_responses_enabled()
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.

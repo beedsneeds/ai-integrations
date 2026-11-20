@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from openai import (
+    APIConnectionError,
+    APIStatusError,
     AsyncOpenAI,
     AuthenticationError,
     NotFoundError,
@@ -30,12 +32,32 @@ from openai import (
 from openai.resources.responses import AsyncResponses
 from openai.types.responses import Response
 
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.api.enums.v1 import PendingActivityState
 from temporalio.client import WorkflowExecutionStatus
+from temporalio.converter import ActivitySerializationContext
 from temporalio.exceptions import ApplicationError
 from temporalio.openai_agents._heartbeat_decorator import set_heartbeat_details
 from temporalio.service import RPCError, RPCStatusCode
+
+BACKGROUND_RESPONSES_PATCH = "temporalio.openai_agents.background-responses"
+"""Patch ID that gates waiting for, continuing and refusing background model calls.
+
+Runs that started an agent run before the patch keep the earlier behavior: a background
+call returns its response unfinished, and a streamed one is not refused.
+"""
+
+
+def background_responses_enabled() -> bool:
+    """Return whether this workflow run's background model calls get the plugin's handling.
+
+    ``Runner.run`` and ``Runner.run_streamed`` call this before they schedule any model
+    activity, so a run that started an agent run on an earlier release replays the call
+    without the patch marker and keeps the earlier behavior. The SDK memoizes the answer
+    for the rest of the run.
+    """
+    return workflow.patched(BACKGROUND_RESPONSES_PATCH)
+
 
 # The heartbeat details key that carries a background response's ID to the next
 # attempt. Attempts on newer workers read what older workers wrote, so keep it stable.
@@ -46,11 +68,31 @@ _EXPIRED_ERROR_TYPE = "OpenAIBackgroundResponseExpired"
 _FAILED_ERROR_TYPE = "OpenAIBackgroundResponseFailed"
 _CANCELLED_ERROR_TYPE = "OpenAIBackgroundResponseCancelled"
 
-# Error codes of a failed response that another attempt can get past. The other
-# codes describe the request itself, such as a blocked prompt or an invalid image,
-# so a new response for the same request would fail the same way.
-_TRANSIENT_ERROR_CODES = frozenset(
-    {"server_error", "rate_limit_exceeded", "vector_store_timeout"}
+# Error codes of a failed response that describe the request itself, such as a
+# blocked prompt or an invalid image, so a new response for the same request would
+# fail the same way. Other codes, including ones OpenAI adds later, are left to the
+# retry policy, as an error without an HTTP status is.
+_PERMANENT_ERROR_CODES = frozenset(
+    {
+        "invalid_prompt",
+        "data_residency_mismatch",
+        "bio_policy",
+        "misalignment_policy_violation",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_base64_image",
+        "invalid_image_url",
+        "image_too_large",
+        "image_too_small",
+        "image_parse_error",
+        "image_content_policy_violation",
+        "invalid_image_mode",
+        "image_file_too_large",
+        "unsupported_image_media_type",
+        "empty_image_file",
+        "failed_to_download_image",
+        "image_file_not_found",
+    }
 )
 _RUNNING_STATUSES = frozenset({"queued", "in_progress"})
 
@@ -62,6 +104,10 @@ _CANCEL_OPTIONS = ("extra_headers", "extra_query", "timeout")
 # Seconds a cancel or a describe may take, so that ending the attempt is not held up.
 _CANCEL_TIMEOUT = 5.0
 _DESCRIBE_TIMEOUT = 5.0
+# Describe errors that only a permission change fixes, as the stateful MCP session has.
+_DESCRIBE_PERMISSION_ERRORS = frozenset(
+    {RPCStatusCode.PERMISSION_DENIED, RPCStatusCode.UNAUTHENTICATED}
+)
 # Seconds a cancelled attempt waits for the reply to a create already sent, so that
 # the job OpenAI may have accepted can still be cancelled or continued.
 _CREATE_REPLY_TIMEOUT = 10.0
@@ -77,26 +123,6 @@ class _PollSchedule:
 
 
 _POLL = _PollSchedule()
-
-
-@dataclass(frozen=True)
-class HeartbeatThrottle:
-    """How the Worker throttles heartbeats.
-
-    The Worker's ``default_heartbeat_throttle_interval`` and
-    ``max_heartbeat_throttle_interval`` options, with the Worker's own defaults.
-    """
-
-    default: timedelta = timedelta(seconds=30)
-    maximum: timedelta = timedelta(seconds=60)
-
-    def interval(self, heartbeat_timeout: timedelta | None) -> timedelta:
-        """How long the Worker can hold a heartbeat other than an attempt's first.
-
-        Computed as Core does, which takes a zero heartbeat timeout for none.
-        """
-        held = heartbeat_timeout * 0.8 if heartbeat_timeout else self.default
-        return min(held, self.maximum)
 
 
 def requests_background(extra_args: Mapping[str, Any] | None, extra_body: Any) -> bool:
@@ -119,14 +145,14 @@ def inherited_response_id() -> str | None:
     return None
 
 
-def _record(response_id: str) -> bool:
-    """Heartbeat the ID. Returns whether the worker sends it at once."""
-    return set_heartbeat_details({_DETAILS_KEY: response_id})
+def _record(response_id: str) -> None:
+    """Heartbeat the ID, and keep it in every later heartbeat of the attempt."""
+    set_heartbeat_details({_DETAILS_KEY: response_id})
 
 
-def _is_transient_failure(response: Response) -> bool:
+def _is_permanent_failure(response: Response) -> bool:
     error = response.error
-    return error is None or error.code in _TRANSIENT_ERROR_CODES
+    return error is not None and error.code in _PERMANENT_ERROR_CODES
 
 
 def _permanent_failure(response: Response) -> ApplicationError:
@@ -154,29 +180,17 @@ class BackgroundCall:
         inherited_id: str | None,
         *,
         seed: bool = True,
-        throttle: HeartbeatThrottle | None = None,
     ) -> None:
         """Start the attempt, continuing ``inherited_id`` if an earlier attempt left one.
 
         With ``seed``, the attempt's heartbeats carry ``inherited_id`` on to the next.
-        ``throttle`` is the Worker's heartbeat throttling, which decides when an ID
-        this attempt records has reached the server.
         """
-        self._throttle = throttle or HeartbeatThrottle()
         self._responses: AsyncResponses = client.responses
         self._request_options: dict[str, Any] = {}
         self.response_id = inherited_id
         self._may_be_running = inherited_id is not None
         # Whether the Agents SDK asked for the response through this attempt.
         self.intercepted = False
-        # Whether response_id came from an earlier attempt, so the server holds it.
-        self._id_inherited = inherited_id is not None
-        # Event loop time this attempt recorded the ID of a response it started.
-        self._id_recorded_at: float | None = None
-        # Whether the worker sent that heartbeat at once instead of throttling it.
-        self._id_sent_at_once = False
-        # Event loop time at which a cancel interrupted the create, if one did.
-        self.cancelled_at: float | None = None
         if inherited_id is not None and seed:
             # Heartbeat now: the timer's next heartbeat would otherwise send no ID,
             # and a failure before it would carry none to the next attempt.
@@ -209,9 +223,26 @@ class BackgroundCall:
         return await self._wait(response)
 
     async def _retrieve(self, response_id: str) -> Response:
-        return await cast(Any, self._responses).retrieve(
-            response_id, **self._request_options
-        )
+        """Read the response, reading it again after a transient error."""
+        delay = _POLL.initial
+        while True:
+            try:
+                return await cast(Any, self._responses).retrieve(
+                    response_id, **self._request_options
+                )
+            except Exception as err:
+                wait = _read_again_after(err)
+                if wait is None:
+                    raise
+                pause = max(delay, wait.total_seconds())
+                activity.logger.debug(
+                    "Could not read background response %s, reading it again in %.1f s",
+                    response_id,
+                    pause,
+                    exc_info=True,
+                )
+            await asyncio.sleep(pause)
+            delay = min(delay * _POLL.factor, _POLL.maximum)
 
     async def _reattach(self) -> Response | None:
         response_id = self.response_id
@@ -234,7 +265,7 @@ class BackgroundCall:
         if status in _RUNNING_STATUSES or status == "completed":
             return response
         self._may_be_running = False
-        if status == "failed" and not _is_transient_failure(response):
+        if status == "failed" and _is_permanent_failure(response):
             # The same request would fail the same way: fail as the attempt that
             # saw it fail did, without paying for another response.
             raise _permanent_failure(response)
@@ -245,7 +276,6 @@ class BackgroundCall:
         try:
             response = cast(Response, await asyncio.shield(create))
         except asyncio.CancelledError:
-            self.cancelled_at = asyncio.get_running_loop().time()
             await self._record_late_reply(create)
             raise
         self._started(response.id)
@@ -273,27 +303,13 @@ class BackgroundCall:
     def _started(self, response_id: str) -> None:
         self.response_id = response_id
         self._may_be_running = True
-        self._id_inherited = False
-        self._id_recorded_at = asyncio.get_running_loop().time()
-        # The worker sends an attempt's first heartbeat at once.
-        self._id_sent_at_once = _record(response_id)
+        _record(response_id)
         activity.logger.debug("Started background response %s", response_id)
 
-    def id_reached_server(self, cancelled_at: float) -> bool:
-        """Whether a retry after a cancel at ``cancelled_at`` can read the response ID.
-
-        Once the worker knows an attempt is gone, it drops the heartbeats it has not
-        sent, so a later attempt finds only an ID sent before then.
-        """
-        if self._id_inherited:
-            return True
-        recorded_at = self._id_recorded_at
-        if recorded_at is None or recorded_at > cancelled_at:
-            return False
-        held = self._throttle.interval(activity.info().heartbeat_timeout)
-        return (
-            self._id_sent_at_once or cancelled_at - recorded_at >= held.total_seconds()
-        )
+    @property
+    def may_be_running(self) -> bool:
+        """Whether the response this attempt tracks may still be running."""
+        return self._may_be_running
 
     async def _wait(self, response: Response) -> Response:
         delay = _POLL.initial
@@ -313,7 +329,7 @@ class BackgroundCall:
                     non_retryable=True,
                 ) from err
         self._may_be_running = False
-        if response.status == "failed" and not _is_transient_failure(response):
+        if response.status == "failed" and _is_permanent_failure(response):
             raise _permanent_failure(response)
         if response.status == "cancelled":
             # Not this attempt's cancel: the next attempt starts a new response.
@@ -321,7 +337,7 @@ class BackgroundCall:
                 "The OpenAI background response was cancelled before it finished",
                 type=_CANCELLED_ERROR_TYPE,
             )
-        # Completed, incomplete, or failed in a way a new response can get past:
+        # Completed, incomplete, or failed with a code not known to be permanent:
         # the Agents SDK handles it as in a native run.
         return response
 
@@ -454,10 +470,12 @@ def _next_retry_delay(override: timedelta | None) -> timedelta:
         else initial * 100
     )
     # Bounded so a long run of attempts can't overflow the power.
-    exponent = min(max(info.attempt - 1, 0), 64)
-    return timedelta(
-        seconds=min(initial * policy.backoff_coefficient**exponent, maximum)
-    )
+    try:
+        delay = initial * policy.backoff_coefficient ** max(info.attempt - 1, 0)
+    except OverflowError:
+        # After enough attempts, the delay passed the maximum long ago.
+        delay = maximum
+    return timedelta(seconds=min(delay, maximum))
 
 
 def _no_retry_left(next_delay: timedelta | None = None) -> bool:
@@ -484,52 +502,135 @@ def _no_retry_left(next_delay: timedelta | None = None) -> bool:
     return False
 
 
-def is_final_failure(err: BaseException) -> bool:
-    """Whether Temporal will not retry this activity after it fails with ``err``."""
+def _retryable(err: BaseException) -> bool:
+    """Whether the retry policy retries ``err``, if attempts and time remain."""
     if isinstance(err, ApplicationError) and err.non_retryable:
-        return True
+        return False
     policy = activity.info().retry_policy
     error_type = (err.type if isinstance(err, ApplicationError) else None) or type(
         err
     ).__name__
-    if policy is not None and error_type in (policy.non_retryable_error_types or ()):
-        return True
-    return _no_retry_left(
+    return policy is None or error_type not in (policy.non_retryable_error_types or ())
+
+
+def is_final_failure(err: BaseException) -> bool:
+    """Whether Temporal will not retry this activity after it fails with ``err``."""
+    return not _retryable(err) or _no_retry_left(
         err.next_retry_delay if isinstance(err, ApplicationError) else None
     )
 
 
-async def _activity_still_pending() -> bool | None:
-    """Whether the server still runs this activity, None if it can't be told."""
+def _read_again_after(err: Exception) -> timedelta | None:
+    """How long to wait before reading a response again after ``err``, None to raise.
+
+    Reading resends no request, so the attempt reads again after the errors the OpenAI
+    client retries, as Temporal's frequent-polling sample does, and waits at least as
+    long as the provider asks. The retry policy's ``non_retryable_error_types`` govern
+    the server's retries of the activity, not these reads. Errors the background call
+    handles itself, such as a deleted response, and other errors end the attempt.
+    """
+    if isinstance(err, (NotFoundError, AuthenticationError, PermissionDeniedError)):
+        return None
+    if isinstance(err, APIConnectionError):
+        # Also a timeout.
+        return timedelta(0)
+    if not isinstance(err, APIStatusError):
+        return None
+    # Imported here because that module imports this one.
+    from temporalio.openai_agents._invoke_model_activity import (
+        _raise_for_openai_status,
+    )
+
+    try:
+        _raise_for_openai_status(err)
+    except ApplicationError as translated:
+        if translated.non_retryable:
+            return None
+        return translated.next_retry_delay or timedelta(0)
+
+
+async def _next_attempt_reads(response_id: str) -> bool | None:
+    """Whether a later attempt will read ``response_id``, None if the server can't tell.
+
+    After an attempt times out, the server has usually decided whether to retry it: the
+    activity is pending at another attempt, or is gone. Its heartbeat details are what
+    that attempt starts with, read back as the stateful MCP session reads back its own.
+    The answer is None while the server still shows this attempt, or when it can't be
+    asked. A heartbeat still on its way can land after the read; the response is then
+    cancelled although a retry could have continued it, which costs a new response but
+    leaves none running.
+    """
     info = activity.info()
     if info.workflow_id is None:
         # A standalone activity has no workflow to describe.
         return None
-    try:
-        handle = activity.client().get_workflow_handle(
-            info.workflow_id, run_id=info.workflow_run_id
+    workflow_id = info.workflow_id
+
+    async def read_back() -> bool | None:
+        client = activity.client()
+        handle = client.get_workflow_handle(workflow_id, run_id=info.workflow_run_id)
+        description = await handle.describe()
+        if description.status != WorkflowExecutionStatus.RUNNING:
+            return False
+        pending = next(
+            (
+                pending
+                for pending in description.raw_description.pending_activities
+                if pending.activity_id == info.activity_id
+            ),
+            None,
         )
-        description = await asyncio.wait_for(handle.describe(), _DESCRIBE_TIMEOUT)
+        if (
+            pending is None
+            or pending.state
+            == PendingActivityState.PENDING_ACTIVITY_STATE_CANCEL_REQUESTED
+        ):
+            return False
+        converter = client.data_converter.with_context(
+            ActivitySerializationContext(
+                namespace=info.namespace,
+                workflow_id=workflow_id,
+                workflow_type=info.workflow_type,
+                activity_type=info.activity_type,
+                activity_id=info.activity_id,
+                activity_task_queue=info.task_queue,
+                is_local=info.is_local,
+            )
+        )
+        details = await converter.decode(pending.heartbeat_details.payloads)
+        if not any(
+            isinstance(detail, Mapping)
+            and cast(Mapping[str, Any], detail).get(_DETAILS_KEY) == response_id
+            for detail in details
+        ):
+            return False
+        # Another attempt means the server retried the activity, or an operator reset
+        # it; the same attempt means the server hasn't processed the timeout yet.
+        return True if pending.attempt != info.attempt else None
+
+    try:
+        return await asyncio.wait_for(read_back(), _DESCRIBE_TIMEOUT)
     except Exception as err:
         if isinstance(err, RPCError) and err.status == RPCStatusCode.NOT_FOUND:
             # The workflow run is gone, so no attempt follows.
             return False
+        if isinstance(err, RPCError) and err.status in _DESCRIBE_PERMISSION_ERRORS:
+            reason = (
+                f"the server refused it ({err.status.name}). Give the worker's client "
+                "permission to describe workflows in this namespace"
+            )
+        elif isinstance(err, asyncio.TimeoutError):
+            reason = f"it took longer than {_DESCRIBE_TIMEOUT:g} seconds"
+        else:
+            reason = "it failed"
         activity.logger.warning(
-            "Could not describe the workflow, so the background response is left "
-            "running for a retry that may not come. The worker's client needs "
-            "permission to describe workflows in this namespace.",
+            "Could not describe the workflow to tell whether a retry will continue "
+            "background response %s, so the retry policy decides: %s",
+            response_id,
+            reason,
             exc_info=True,
         )
         return None
-    if description.status != WorkflowExecutionStatus.RUNNING:
-        return False
-    for pending in description.raw_description.pending_activities:
-        if pending.activity_id == info.activity_id:
-            return (
-                pending.state
-                != PendingActivityState.PENDING_ACTIVITY_STATE_CANCEL_REQUESTED
-            )
-    return False
 
 
 async def cancel_reason(call: BackgroundCall) -> str | None:
@@ -542,25 +643,20 @@ async def cancel_reason(call: BackgroundCall) -> str | None:
         return None
     if details.cancel_requested:
         return "the workflow cancelled the call"
-    if details.reset:
-        return "the activity was reset"
-    if details.paused:
+    if details.reset or details.paused:
+        # Both keep the heartbeat details unless the operator asks to clear them, so
+        # the next attempt continues the response.
         return None
     if details.worker_shutdown:
         # The worker reports the attempt's last heartbeat details with its failure.
         return "no attempt follows" if _no_retry_left() else None
-    # A timeout can also arrive as not_found, so check it first.
+    # A timeout, or a cancel from a workflow that closed (both can arrive as not_found).
     if details.timed_out or details.not_found:
-        if _no_retry_left():
-            return "no attempt follows"
-        cancelled_at = call.cancelled_at
-        if cancelled_at is None:
-            cancelled_at = asyncio.get_running_loop().time()
-        if not call.id_reached_server(cancelled_at):
-            return "its ID never reached the server, so no attempt can continue it"
-        if details.timed_out:
+        if call.response_id is None or not call.may_be_running:
             return None
-        # The workflow may have closed, or the attempt timed out with a retry to follow.
-        pending = await _activity_still_pending()
-        return "the workflow no longer runs the call" if pending is False else None
+        # The server has usually decided by now whether to retry, so ask it first.
+        reads = await _next_attempt_reads(call.response_id)
+        if reads is None:
+            return "no attempt follows" if _no_retry_left() else None
+        return None if reads else "no later attempt will read its ID"
     return None

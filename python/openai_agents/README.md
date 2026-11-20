@@ -1154,35 +1154,22 @@ class ReviewAgent:
 
 The model activity (`invoke_model_activity`) starts the response in background mode and records
 the response's ID in the activity's heartbeat details. It then polls the response until it
-finishes (first after 1 second, then backing off to every 5 seconds). Subsequent retries read
-the ID from the heartbeat details and wait for the same response, or return it at once if it
-already completed.
-
-The plugin automatically cancels the response when:
-
-- the workflow requests cancellation of the model activity, for example when an input guardrail
-  trips or the workflow is cancelled;
-- the activity is reset while an attempt runs;
-- the attempt fails, times out or its Worker shuts down, and Temporal won't retry it.
-
-See [Responses Left Running](#responses-left-running) for cases where no attempt cancels or
-continues the response.
+finishes (first after 1 second, then backing off to every 5 seconds). A transient error while
+polling, such as a dropped connection, a 429 or a 5xx, only delays the next poll. Subsequent retries read the ID from the heartbeat details and wait for
+the same response, or return it at once if it already completed.
 
 ### Supported Calls
 
 The plugin supports background mode only for non-streaming calls through its default model
 provider (`OpenAIAgentsPlugin` without `model_provider`) with the Responses API over HTTP.
 
-Do not use streaming and background mode together. [Streaming](#streaming) calls (`Runner.run_streamed`) 
-currently **don't** reattach to the same response: a retry starts a new one and the plugin doesn't cancel 
-the interrupted response, which runs to completion and is billed in full.
+[Streaming](#streaming) calls with a Responses API model and some other calls fail before
+sending any request; [Errors and Retries](#errors-and-retries) lists them under
+`OpenAIBackgroundUnsupported`.
 
-Some Responses API calls fail before sending any request; [Errors and Retries](#errors-and-retries)
-lists them under `OpenAIBackgroundUnsupported`.
-
-Other models, such as `OpenAIResponsesWSModel` (the Responses websocket transport),
-`OpenAIChatCompletionsModel` and `LitellmModel`, receive `background` unchanged, as they do
-outside Temporal.
+Other models, such as `OpenAIChatCompletionsModel` and `LitellmModel`, receive `background`
+unchanged, as they do outside Temporal. So does `OpenAIResponsesWSModel` (the Responses
+websocket transport), in non-streaming calls.
 
 ### Timeouts, Retention and Permissions
 
@@ -1194,6 +1181,10 @@ retry delay and uses an attempt; when none are left, the plugin cancels the resp
 call fails. `schedule_to_close_timeout` limits the whole call, across all attempts and the
 waits between them.
 
+A response can also wait in OpenAI's queue for hours, if `background_options.completion_window`
+asks for it (pass it in `extra_body`). The attempt polls every 5 seconds throughout, so set the
+timeouts for that duration.
+
 Without `store=True`, OpenAI keeps a background response only for a limited time (previously 10
 minutes), so set `store=True` when the response may need to be read later. The time counts
 waits between attempts, pauses and Worker outages, not only the call itself. Projects with Zero
@@ -1202,11 +1193,9 @@ happens when OpenAI deletes it, see `OpenAIBackgroundResponseExpired` in
 [Errors and Retries](#errors-and-retries). Additionally, a later call that names a deleted
 response in `previous_response_id` fails.
 
-Give the Worker's client permission to describe workflows. When a heartbeat finds that the
-server no longer has the attempt, for example because its workflow closed or the attempt timed
-out, the attempt describes its workflow to tell whether a retry will continue the response, and
-cancels the response if not. If it can't describe the workflow, for example without that
-permission, it leaves the response running and logs a warning.
+Give the Worker's client permission to describe workflows. An attempt that times out describes
+its workflow to tell whether a retry will continue the response; see
+[Cancellation and Responses Left Running](#cancellation-and-responses-left-running).
 
 ### Errors and Retries
 
@@ -1214,40 +1203,68 @@ A background call can fail with these `ApplicationError` types:
 
 | `ApplicationError` type | Retryable | When |
 | --- | :---: | --- |
-| `OpenAIBackgroundUnsupported` | No | The call uses a custom [model provider](#model-providers) whose model is an `OpenAIResponsesModel` (the plugin can't wait for the response, so the Agents SDK would return it unfinished), sets `conversation_id` (chain responses with `previous_response_id` instead) or runs with `use_local_activity=True` (local activities don't support heartbeats); it fails before any request is sent |
+| `OpenAIBackgroundUnsupported` | No | The call streams (`Runner.run_streamed`) with a Responses API model (a retry can't continue a streamed response, and closing the stream doesn't stop a background one), uses a custom [model provider](#model-providers) whose model is an `OpenAIResponsesModel` (the plugin can't wait for the response, so the Agents SDK would return it unfinished), sets `conversation_id` (chain responses with `previous_response_id` instead) or runs with `use_local_activity=True` (local activities don't support heartbeats); it fails before any request is sent |
 | `OpenAIBackgroundResponseExpired` | No | OpenAI deleted the response while the activity waited for it; if it's deleted between attempts, the next attempt starts a new response instead |
-| `OpenAIBackgroundResponseFailed` | No | The response failed with an error code other than `server_error`, `rate_limit_exceeded` or `vector_store_timeout` |
+| `OpenAIBackgroundResponseFailed` | No | The response failed with a code about the request itself, so a new response would fail the same way: `invalid_prompt`, `data_residency_mismatch`, `bio_policy`, `misalignment_policy_violation`, or any code about an input image, such as `invalid_image_url` |
 | `OpenAIBackgroundResponseCancelled` | Yes | The response was cancelled outside the plugin; the retry starts a new response |
 
-A response that fails with one of the three excluded codes or a response that ends incomplete raises
-`ModelBehaviorError` just as it does without background mode. Retries would then start a new response.
+A response that fails with any other code, including one OpenAI adds later, or that ends incomplete
+raises `ModelBehaviorError` as it does without background mode, and the retry starts a new response.
 
 Each retry from `ModelSettings.retry` is a new activity, so it starts a new response; prefer
 `retry_policy` in `ModelActivityParameters`.
 
-### Responses Left Running
+### Cancellation and Responses Left Running
 
-A background response that no attempt reads or cancels keeps running and is billed in full, including the
-hosted tools it calls, whereas an interrupted request without background mode stops when its
-connection closes. Responses continue running when:
+A background response that no attempt reads or cancels keeps running and is billed in full,
+including the hosted tools it calls, whereas an interrupted request without background mode
+stops when its connection closes.
+
+The plugin automatically cancels the response when:
+
+- the workflow requests cancellation of the model activity, for example when an input guardrail
+  trips or the workflow is cancelled;
+- the attempt fails, times out or its Worker shuts down, and no later attempt will continue the
+  response.
+
+After a failure or a Worker shutdown, the activity's retry policy decides whether a later attempt
+follows. After a timeout, or when the server no longer has the attempt, for example because its
+workflow closed, the attempt describes its workflow. If the server already shows another
+attempt, the response is left running only if that attempt's heartbeat details hold its ID; if
+the workflow closed or the activity is no longer pending, the response is cancelled. While the
+server still shows the timed-out attempt, or if the attempt can't describe the workflow (it logs
+a warning, for example without permission), the retry policy decides.
+
+Responses continue running when:
 
 - a Worker crashes after OpenAI accepts the response and before the heartbeat that carries
   its ID reaches the server (the Worker can hold that heartbeat for up to 0.8 times the
-  `heartbeat_timeout`);
+  `heartbeat_timeout`, at most the Worker's `max_heartbeat_throttle_interval`, 60 seconds by
+  default, and for its `default_heartbeat_throttle_interval`, 30 seconds by default, when there
+  is no heartbeat timeout);
+- the reply to the request that starts the response is lost, for example on a dropped
+  connection: the OpenAI client sends no idempotency key to find the response with, and an
+  application's own client with retries turned on sends the request again, which starts a second
+  response;
+- OpenAI refuses a later attempt's request to read the response (a 401 or 403): that attempt
+  starts a new response and can't cancel the first;
 - the last attempt's Worker crashes;
 - the workflow is cancelled or terminated while the activity waits to retry;
-- the activity is reset or unpaused with `reset_heartbeat=True` while no attempt runs;
-- the attempt can't describe its workflow, or is cancelled with no reason given;
-- a [streaming](#supported-calls) call is interrupted or cancelled;
+- the activity is reset or unpaused with `reset_heartbeat=True`, which clears the heartbeat
+  details;
+- the retry policy predicts a retry that doesn't come, for example after `update-options`
+  lowered the maximum attempts, since the attempt only knows the policy it started with;
+- the attempt is cancelled with no reason given;
 - Workers are rolled back to a version without this feature.
 
 ### Upgrading
 
 Earlier versions of the plugin returned a non-streaming call's background response unfinished,
-with no output. Upgrade every Worker that runs model activities before setting `background`.
-The calls that [Errors and Retries](#errors-and-retries) lists under `OpenAIBackgroundUnsupported`
-now fail. If open runs make those calls, remove the setting before you upgrade the Workers, or
-those runs fail at their next model call.
+with no output, and refused no background call. The new behavior is gated by the patch
+`temporalio.openai_agents.background-responses`, checked when `Runner.run` or
+`Runner.run_streamed` starts. A workflow whose first agent run started on an earlier release
+keeps the earlier behavior. Upgrade every Worker that runs model activities before setting `background`:
+an earlier Worker returns the response unfinished.
 
 ## Feature Support
 
